@@ -1,0 +1,497 @@
+procedure TTabelasSaldoData.PrepararDadosDRE(out TabelasDRE: TStrings; const TabelaTemporaria: TTabelaTemporaria; const SelecaoEmpresa, SelecaoEstabelecimento: ICRDLookupMultiSelectValues;
+  const DataInicial, DataFinal: TDate; const ConsolidaEstabelecimento, ApuracaoAnual: Boolean; const Campos: TList<TCampoTabelasSaldo>; const IndiceImagemSelecionado: Integer);
+const TABELA_LANCAMENTO = 'Lancamento';
+      TABELA_BALANCETE = 'BalanceteGrauMax';
+      TABELA_BALANCETE_GRAUS_MENOS = 'BalanceteGrauMaxMenos';
+      CAMPOS_SEM_UPDATE: Array [0..2] of String = ('classificacao', 'cd_conta', 'descricao');
+      CAMPOS_DEBITOS: Array [0..2] of String = ('saldo_anterior', 'debito', 'saldo_atual');
+      CAMPOS_CREDITOS: Array [0..2] of String = ('saldo_anterior', 'credito', 'saldo_atual');
+      CAMPOS_PRECISAM_VALORES_ANTES_PERIODO: Array [0..0] of String = ('saldo_anterior'); //, 'saldo_atual');
+      CAMPOS_PRECISAM_VALORES_ANTES_PERIODO_APENAS_SE_MARCADO_ANTERIOR: Array [0..0] of String = ('saldo_atual');
+var TabelaLancamento, TabelaBalancetes, TabelaBalancetesTotais, Script, CamposValor, sWhere, sWhereTransferencia, sWhereEmpresa, sWhereEstabelecimento,
+  sFuncaoLength, sLeftJoin, sGroupBy: String;
+    Campo: TCampoTabelasSaldo;
+    i, iTotalNiveisPlanoConta: Integer;
+    AuxDS: TEFCData;
+    PesquisaDataInicial, PesquisaDataFinal: TDate;
+    PrecisaConsultarValoresLancamento, NecessarioSaldoPeriodoAnterior, bSomaDebito, bSomaCredito, bSaldoAtualSomaDebito, bSaldoAtualSomaCredito: Boolean;
+  {$region 'function ObterConsultaPreencherValoresTotais'}
+  function ObterConsultaPreencherValoresTotais(const NomeCampo: String; DataInicial, DataFinal: TDateTime; const SomarDebitosPeriodo, SomarCreditoPeriodo: Boolean): String;
+  const TIPO_CONSULTA: Array [0..1] of String = (VALOR_DEBITO, VALOR_CREDITO);
+        IDENTIFICACAO_CAMPO_CONTA: Array [0..1] of String = ('deb', 'cre');
+  var sSQLConsulta, sFROM, sCampoNaturezaMultiplicador, sTabelaInnerJoin: String;
+      i: Integer;
+      OpcaoAdicionaCondicaoEstabelecimentoInner: Boolean;
+      APENAS_CONSULTA: Array [0..1] of Boolean;
+  begin
+    if (not (SomarDebitosPeriodo or SomarCreditoPeriodo)) then
+      raise Exception.Create('Necessário preencher ao menos uma opção, debito ou crédito.');
+
+    APENAS_CONSULTA[0] := SomarDebitosPeriodo;
+    APENAS_CONSULTA[1] := SomarCreditoPeriodo;
+    Result := EmptyStr;
+
+    if (FDatabaseType = dtMSSQL) then
+    begin
+      for i := 0 to High(TIPO_CONSULTA) do
+      begin
+        sSQLConsulta := EmptyStr;
+        if APENAS_CONSULTA[i] then
+        begin
+          sFROM := 'FROM ' + TabelaBalancetes;
+          sCampoNaturezaMultiplicador := TabelaBalancetes + '.natureza';
+          sTabelaInnerJoin := TabelaBalancetes;
+          OpcaoAdicionaCondicaoEstabelecimentoInner := ConsolidaEstabelecimento;
+
+          sSQLConsulta := 'SELECT ' + TabelaLancamento + '.enterprise_id, ' +
+                                      IfThen(ConsolidaEstabelecimento, TabelaLancamento + '.cd_empresa, ' ) +
+                                      TabelaLancamento + '.cd_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] + ' cd_conta, ' +
+                                      TabelaLancamento + '.cla_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] + ' cla_conta, ' +
+                                     '(CASE ' +
+                                        'WHEN (' + sCampoNaturezaMultiplicador + ' = ' + QuotedStr(TIPO_CONSULTA[i]) + ') THEN 1 ' +
+                                        'ELSE -1 ' +
+                                     'END) MULTIPLICADOR, ' +
+                                      TabelaLancamento + '.vl_lancamento ' +
+                          sFROM + ' ' +
+                          'INNER JOIN ' + TabelaLancamento + ' ON (' + sTabelaInnerJoin + '.enterprise_id = ' + TabelaLancamento + '.enterprise_id ' +
+                                                  IfThen(OpcaoAdicionaCondicaoEstabelecimentoInner, 'AND ' + sTabelaInnerJoin + '.cd_empresa = ' + TabelaLancamento + '.cd_empresa ') +
+                                                  'AND ' + sTabelaInnerJoin + '.cd_conta = ' + TabelaLancamento + '.cd_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] + ' ' +
+                                                  'AND ' + sTabelaInnerJoin + '.classificacao = ' + TabelaLancamento + '.cla_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] + ') ' +
+                          'WHERE ' + TabelaLancamento + '.cd_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] + ' IS NOT NULL ';
+          if DataInicial > 0 then
+            sSQLConsulta := sSQLConsulta  + ' AND dt_lancamento >= ' + DataAccess2(DataInicial);
+
+          if DataFinal > 0 then
+            sSQLConsulta := sSQLConsulta  + ' AND dt_lancamento <= ' + DataAccess2(DataFinal);
+        end;
+
+        if ((not Result.IsEmpty) and (not sSQLConsulta.IsEmpty)) then
+          Result := Result + ' UNION ALL ';
+
+        Result := Result + sSQLConsulta;
+      end;
+
+      Result := 'SELECT B.enterprise_id, '+
+                       'B.cd_conta, '+
+                        IfThen(ConsolidaEstabelecimento, 'B.cd_empresa, ' ) +
+                       'B.cla_conta, '+
+                       'SUM(B.MULTIPLICADOR * B.vl_lancamento) as vl_lancamento ' +
+                'FROM (' + Result + ') B ' +
+                'GROUP BY B.enterprise_id, ' +
+                         'B.cd_conta, ' +
+                          IfThen(ConsolidaEstabelecimento, 'B.cd_empresa, ' ) +
+                         'B.cla_conta';
+
+
+
+        Result := ' UPDATE ' + TabelaBalancetes +
+                  ' SET ' + TabelaBalancetes + '.' + NomeCampo + ' = ' + TabelaBalancetes + '.' + NomeCampo + ' + A.vl_lancamento ' +
+                  ' FROM ' + TabelaBalancetes +
+                  ' INNER JOIN (' + Result + ') A ON (' + TabelaBalancetes + '.enterprise_id = A.enterprise_id' +
+               IfThen(ConsolidaEstabelecimento, ' AND ' + TabelaBalancetes + '.cd_empresa = A.cd_empresa') +
+                                               ' AND ' + TabelaBalancetes + '.cd_conta = A.cd_conta' +
+                                               ' AND ' + TabelaBalancetes + '.classificacao = A.cla_conta)'
+    end
+    else
+    begin
+      if SomarDebitosPeriodo and SomarCreditoPeriodo then
+        raise Exception.Create('MySQL não suporta duas tabelas temporárias na mesma consulta.');
+
+      sSQLConsulta := EmptyStr;
+      for i := 0 to High(TIPO_CONSULTA) do
+      begin
+        if APENAS_CONSULTA[i] then
+        begin
+          sSQLConsulta := 'SELECT ' + TabelaLancamento + '.enterprise_id, ' +
+                                      IfThen(ConsolidaEstabelecimento, TabelaLancamento + '.cd_empresa, ' ) +
+                                      TabelaLancamento + '.cd_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] + ' cd_conta, ' +
+                                      TabelaLancamento + '.cla_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] + ' cla_conta, ' +
+                                      'SUM(' + TabelaLancamento + '.vl_lancamento) vl_lancamento ' +
+                          'FROM ' + TabelaLancamento + ' ' +
+
+                          'WHERE ' + TabelaLancamento + '.cd_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] + ' IS NOT NULL ';
+
+          if DataInicial > 0 then
+            sSQLConsulta := sSQLConsulta  + ' AND dt_lancamento >= ' + DataAccess2(DataInicial);
+
+          if DataFinal > 0 then
+            sSQLConsulta := sSQLConsulta  + ' AND dt_lancamento <= ' + DataAccess2(DataFinal);
+
+          sSQLConsulta := sSQLConsulta +
+                        ' GROUP BY ' + TabelaLancamento + '.enterprise_id, ' +
+                                       IfThen(ConsolidaEstabelecimento, TabelaLancamento + '.cd_empresa, ' ) +
+                                       TabelaLancamento + '.cd_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] + ', ' +
+                                       TabelaLancamento + '.cla_conta_' + IDENTIFICACAO_CAMPO_CONTA[i] ;
+
+          sSQLConsulta := ' UPDATE ' + TabelaBalancetes +
+                            ' INNER JOIN (' + sSQLConsulta + ') A ON (' + TabelaBalancetes + '.enterprise_id = A.enterprise_id' +
+                         IfThen(ConsolidaEstabelecimento, ' AND ' + TabelaBalancetes + '.cd_empresa = A.cd_empresa') +
+                                                         ' AND ' + TabelaBalancetes + '.cd_conta = A.cd_conta' +
+                                                         ' AND ' + TabelaBalancetes + '.classificacao = A.cla_conta)' +
+                            ' SET ' + TabelaBalancetes + '.' + NomeCampo + ' = (' + TabelaBalancetes + '.' + NomeCampo + ' + A.vl_lancamento * ' +
+                                                                                '(CASE ' +
+                                                                                    'WHEN (' + TabelaBalancetes + '.natureza = ' + QuotedStr(TIPO_CONSULTA[i]) + ') THEN 1 ' +
+                                                                                    'ELSE -1 ' +
+                                                                                 'END))';
+        end;
+      end;
+      Result := sSQLConsulta;
+    end;
+  end;
+  {$endregion}
+begin
+  TabelasDRE := TStringList.Create;
+
+  TransformaMultiSelecaoEmWhere(SelecaoEmpresa, SelecaoEstabelecimento, 'cd_empresa', EmptyStr, sWhereEmpresa, sWhereEstabelecimento);
+
+  iTotalNiveisPlanoConta := 0;
+  if not FInterromperExecucao then
+  begin
+    AuxDS := TCRDData.CreateEFCData(FDB);
+    try
+      AuxDS.Initialize;
+      AuxDS.Close;
+      AuxDS.SetNoParsing(True);
+      AuxDS.SetSQL('SELECT ' + IfThen(FDatabaseType = dtMSSQL, 'TOP 1 ') + ' num_niveis_plano_contas ' +
+                   'FROM CRDEmpresa ' +
+                   'WHERE ' + sWhereEmpresa +
+                   'ORDER BY num_niveis_plano_contas DESC '+
+                   IfThen(FDatabaseType = dtMYSQL, 'LIMIT 1 '));
+      AuxDS.Open(FDB.GetDataConnection);
+      AuxDS.SetNoParsing(False);
+      iTotalNiveisPlanoConta := AuxDS.GetInteger('num_niveis_plano_contas');
+      AuxDS.Close;
+    finally
+      if Assigned(AuxDS) then
+        FreeAndNil(AuxDS);
+    end;
+  end;
+
+  if (FDatabaseType = dtMSSQL) then
+    sFuncaoLength := 'LEN'
+  else
+    sFuncaoLength := 'LENGTH';
+
+  if (YearOf(DataInicial) <> YearOf(DataFinal)) then
+    raise Exception.Create('Data em anos diferentes.');
+
+  Script := EmptyStr;
+  CamposValor := EmptyStr;
+  NecessarioSaldoPeriodoAnterior := False;
+  for Campo in Campos do
+    if Assigned(Campo.NodeTreeView) then
+      if ((Campo.NodeTreeView.StateIndex = IndiceImagemSelecionado) and (not ProcuraListaString(Campo.ColunaBanco, CAMPOS_SEM_UPDATE))) then
+      begin
+        if not (NecessarioSaldoPeriodoAnterior) then
+          NecessarioSaldoPeriodoAnterior := ProcuraListaString(Campo.ColunaBanco, CAMPOS_PRECISAM_VALORES_ANTES_PERIODO);
+
+        if ((ProcuraListaString(Campo.ColunaBanco, CAMPOS_PRECISAM_VALORES_ANTES_PERIODO)) or
+            (ProcuraListaString(Campo.ColunaBanco, CAMPOS_PRECISAM_VALORES_ANTES_PERIODO_APENAS_SE_MARCADO_ANTERIOR) and NecessarioSaldoPeriodoAnterior)) then
+          CamposValor := CamposValor + ', CAST(COALESCE(SUM(Saldobalanco.vl_saldo), 0) AS decimal(19, 2)) ' + Campo.ColunaBanco
+        else
+          CamposValor := CamposValor + ', CAST(0 AS decimal(19, 2)) ' + Campo.ColunaBanco;
+
+
+        FQuantidadePassosTotais := FQuantidadePassosTotais + IfThen((FDatabaseType = dtMSSQL), 1, 2);
+      end;
+
+  if (ApuracaoAnual) then
+    for i := 1 to 13 do
+    begin
+      if ((i = 13) and (NecessarioSaldoPeriodoAnterior)) then
+        CamposValor := CamposValor + ', CAST(COALESCE(SUM(Saldobalanco.vl_saldo), 0) AS decimal(19, 2)) ' + ObterColunaTotalizacaoMensal(i, False)
+      else
+        CamposValor := CamposValor + ', CAST(0 AS decimal(19, 2)) ' + ObterColunaTotalizacaoMensal(i, False);
+      FQuantidadePassosTotais := FQuantidadePassosTotais + IfThen((FDatabaseType = dtMSSQL), 1, 2);
+    end;
+
+  FQuantidadePassosTotais := FQuantidadePassosTotais + ((iTotalNiveisPlanoConta - 1) * 2);
+  PrecisaConsultarValoresLancamento := not CamposValor.IsEmpty;
+
+  if PrecisaConsultarValoresLancamento then
+    FQuantidadePassosTotais := FQuantidadePassosTotais + 2;
+
+  {$region 'Seleciona Lancamentos'}
+  if ((PrecisaConsultarValoresLancamento) and (not FInterromperExecucao)) then
+  begin
+    TransformaMultiSelecaoEmWhere(SelecaoEmpresa, SelecaoEstabelecimento, 'Lancamento.enterprise_id', IfThen(ConsolidaEstabelecimento, 'Lancamento.cd_empresa'), sWhereEmpresa, sWhereEstabelecimento);
+    sWhere := AdicionaStringComSeparador(sWhereEmpresa, sWhereEstabelecimento, OPERADOR_AND);
+    sWhere := AdicionaStringComSeparador(sWhere, '(Lancamento.situacao = ' + QuotedStr(CSC_SITUACAO_LANCAMENTO_LIBERADO) + ')', OPERADOR_AND);
+    sWhere := AdicionaStringComSeparador(sWhere, '(Lancamento.dt_lancamento <= ' + DataAccess2(DataFinal) + ')', OPERADOR_AND);
+    if (not NecessarioSaldoPeriodoAnterior) then
+      sWhere := AdicionaStringComSeparador(sWhere, '(Lancamento.dt_lancamento >= ' + DataAccess2(DataInicial) + ')', OPERADOR_AND);
+    sWhereTransferencia := EmptyStr;
+    sWhereTransferencia := AdicionaStringComSeparador(sWhereTransferencia, '(Lancamento.tipo_lcto = ' + QuotedStr(TIPO_LANCAMENTO_CONTABIL_TRANSFERENCIA) + ')', OPERADOR_AND);
+    sWhereTransferencia := AdicionaStringComSeparador(sWhereTransferencia, '(Lancamento.dt_lancamento >= ' + DataAccess2(DataInicial) + ')', OPERADOR_AND);
+    sWhereTransferencia := AdicionaStringComSeparador(sWhereTransferencia, '(Lancamento.dt_lancamento <= ' + DataAccess2(DataFinal) + ')', OPERADOR_AND);
+    sWhereTransferencia := '(NOT(' + sWhereTransferencia + '))';
+    sWhere := AdicionaStringComSeparador(sWhere, sWhereTransferencia, OPERADOR_AND);
+    sWhere := 'WHERE ' + sWhere;
+    Script := 'SELECT Lancamento.enterprise_id, ' +
+                     IfThen(ConsolidaEstabelecimento, 'Lancamento.cd_empresa, ') +
+                     'Lancamento.cd_conta_deb, ' +
+                     'Lancamento.cd_conta_cre, ' +
+                     'Lancamento.cla_conta_deb, ' +
+                     'Lancamento.cla_conta_cre, ' +
+                     'Lancamento.cd_historico, ' +
+                     'Lancamento.dt_lancamento, ' +
+                     'Lancamento.vl_lancamento ' +
+              'FROM Lancamento ' +
+              'INNER JOIN CRDPermissaoGrupoEstabelecimento ON (Lancamento.enterprise_id = CRDPermissaoGrupoEstabelecimento.cd_empresa ' +
+                                                          'AND Lancamento.cd_empresa = CRDPermissaoGrupoEstabelecimento.cd_estabelecimento ' +
+                                                          'AND CRDPermissaoGrupoEstabelecimento.cd_grupo_estabelecimento = ' + TCRDConfiguration(Config).GrupoAcessoEstabelecimento.ToString + ') ' +
+              sWhere;
+
+    TabelaTemporaria.CriarTabelaPelaConsultaComNome(Script, TABELA_LANCAMENTO, TabelaLancamento);
+    ProximoPassoNoProgresso()
+  end;
+  {$endregion}
+  {$region ' + 1 Planos Selecionados'}
+  TransformaMultiSelecaoEmWhere(SelecaoEmpresa, SelecaoEstabelecimento, 'Plano.enterprise_id', 'CRDEstabelecimento.cd_estabelecimento', sWhereEmpresa, sWhereEstabelecimento);
+  sWhere := AdicionaStringComSeparador(sWhereEmpresa, sWhereEstabelecimento, OPERADOR_AND);
+  sWhere := AdicionaStringComSeparador(sWhere, '(Plano.nr_grau = CRDEmpresa.num_niveis_plano_contas)', OPERADOR_AND);
+  sWhere := 'WHERE ' + sWhere;
+  sLeftJoin := EmptyStr;
+  sGroupBy := EmptyStr;
+  if (NecessarioSaldoPeriodoAnterior) then
+  begin
+    sLeftJoin := 'LEFT JOIN Saldobalanco ON (Plano.enterprise_id = Saldobalanco.enterprise_id ' +
+       IfThen(ConsolidaEstabelecimento, 'AND CRDEstabelecimento.cd_estabelecimento = Saldobalanco.cd_empresa ') +
+                                        'AND Plano.cd_conta = Saldobalanco.cd_conta ' +
+                                        'AND Plano.classificacao = Saldobalanco.cla_conta) ';
+    sGroupBy := 'GROUP BY Plano.enterprise_id, ' +
+                 IfThen(ConsolidaEstabelecimento, 'CRDEstabelecimento.cd_estabelecimento, ') +
+                         'Plano.classificacao, ' +
+                         'Plano.cd_conta, ' +
+                         'Plano.descricao, ' +
+                         'Plano.nr_grau, ' +
+                         'planoPai.natureza ';
+  end;
+
+  Script := 'SELECT Plano.enterprise_id, ' +
+                   IfThen(ConsolidaEstabelecimento, 'CRDEstabelecimento.cd_estabelecimento cd_empresa, ') +
+                   'Plano.classificacao, ' +
+                   'Plano.cd_conta, ' +
+                   'Plano.descricao, ' +
+                   'Plano.nr_grau, ' +
+                   'planoPai.natureza ' +
+                   CamposValor +
+           ' FROM Plano ' +
+            IfThen(ConsolidaEstabelecimento, 'INNER JOIN CRDEstabelecimento ON (Plano.enterprise_id = CRDEstabelecimento.cd_empresa) ' ) +
+            'INNER JOIN CRDEmpresa ON (Plano.enterprise_id = CRDEmpresa.cd_empresa) ' +
+            'INNER JOIN Plano planoPai ON (Plano.enterprise_id = planoPai.enterprise_id ' +
+                                      'AND planoPai.cd_conta = 0 ' +
+                                      'AND planoPai.classificacao = SUBSTRING(Plano.classificacao, 1, 1)) ' +
+            'INNER JOIN Plano planoComDRE  ON (planoComDRE.enterprise_id = Plano.enterprise_id ' +
+                                          'AND planoComDRE.cd_tipoDRE IS NOT NULL ' +
+                                          'AND planoComDRE.classificacao = SUBSTRING(Plano.classificacao, 1, ' + sFuncaoLength + '(planoComDRE.classificacao))) ' +
+            sLeftJoin +
+            sWhere +
+            sGroupBy;
+
+  if (not FInterromperExecucao) then
+  begin
+    TabelaTemporaria.CriarTabelaPelaConsultaComNome(Script, TABELA_BALANCETE, TabelaBalancetes);
+    TabelasDRE.Add(TabelaBalancetes);
+    ProximoPassoNoProgresso();
+  end;
+  {$endregion}
+  {$region 'Popula Colunas de Valores'}
+  if ((PrecisaConsultarValoresLancamento) and (not FInterromperExecucao)) then
+  begin
+    bSaldoAtualSomaDebito := False;
+    bSaldoAtualSomaCredito := False;
+    for Campo in Campos do
+      if Assigned(Campo.NodeTreeView) then
+        if (Campo.NodeTreeView.StateIndex = IndiceImagemSelecionado) then
+          if (not ProcuraListaString(Campo.ColunaBanco, CAMPOS_SEM_UPDATE)) then
+          begin
+            if FInterromperExecucao then
+              Break;
+
+            AuxDS := TCRDData.CreateEFCData(FDB);
+            try
+              PesquisaDataInicial := 0;
+              if (Campo.ColunaBanco = 'saldo_anterior') then
+                PesquisaDataFinal := DataInicial
+              else
+              if (Campo.ColunaBanco = 'saldo_atual') then
+                PesquisaDataFinal := DataFinal
+              else
+              begin
+                PesquisaDataInicial := DataInicial;
+                PesquisaDataFinal := DataFinal;
+              end;
+
+              bSomaDebito := ProcuraListaString(Campo.ColunaBanco, CAMPOS_DEBITOS);
+              bSomaCredito := ProcuraListaString(Campo.ColunaBanco, CAMPOS_CREDITOS);
+              if (Campo.ColunaBanco = 'debito') then
+                bSaldoAtualSomaDebito := True;
+              if (Campo.ColunaBanco = 'credito') then
+                bSaldoAtualSomaCredito := True;
+
+              if (Campo.ColunaBanco = 'saldo_atual') then
+              begin
+                bSomaDebito := bSaldoAtualSomaDebito;
+                bSomaCredito := bSaldoAtualSomaCredito;
+              end;
+
+              AuxDS.Initialize;
+              AuxDS.Close;
+              AuxDS.SetNoParsing(True);
+              if (FDatabaseType = dtMSSQL) then
+              begin
+                if ((bSomaDebito) or (bSomaCredito)) then
+                begin
+                  AuxDS.SetSQL(ObterConsultaPreencherValoresTotais(Campo.ColunaBanco,
+                                                                   PesquisaDataInicial,
+                                                                   PesquisaDataFinal,
+                                                                   bSomaDebito,
+                                                                   bSomaCredito));
+                  AuxDS.Execute(FDB.GetDataConnection);
+                end;
+                ProximoPassoNoProgresso();
+              end else
+              begin
+                if bSomaDebito then
+                begin
+                  AuxDS.SetSQL(ObterConsultaPreencherValoresTotais(Campo.ColunaBanco,
+                                                                   PesquisaDataInicial,
+                                                                   PesquisaDataFinal,
+                                                                   True,
+                                                                   False));
+                  AuxDS.Execute(FDB.GetDataConnection);
+                end;
+                ProximoPassoNoProgresso();
+
+                if FInterromperExecucao then
+                  Break;
+
+                if bSomaCredito then
+                begin
+                  AuxDS.SetSQL(ObterConsultaPreencherValoresTotais(Campo.ColunaBanco,
+                                                                   PesquisaDataInicial,
+                                                                   PesquisaDataFinal,
+                                                                   False,
+                                                                   True));
+                  AuxDS.Execute(FDB.GetDataConnection);
+                end;
+                ProximoPassoNoProgresso();
+              end;
+              AuxDS.SetNoParsing(False);
+            finally
+              if Assigned(AuxDS) then
+                FreeAndNil(AuxDS);
+            end;
+          end;
+
+    if (ApuracaoAnual) then
+      for i := 1 to 13 do
+      begin
+        if FInterromperExecucao then
+          Break;
+
+        AuxDS := TCRDData.CreateEFCData(FDB);
+        try
+          if (i = 13) then
+          begin
+            PesquisaDataInicial := 0;
+            PesquisaDataFinal := DataFinal;
+          end
+          else
+          begin
+            PesquisaDataInicial := EncodeDate(YearOf(DataInicial), i, 1);
+            PesquisaDataFinal := UltimoDiaMesAno(PesquisaDataInicial);
+          end;
+
+          AuxDS.Initialize;
+          AuxDS.Close;
+          AuxDS.SetNoParsing(True);
+
+          if (FDatabaseType = dtMSSQL) then
+          begin
+            AuxDS.SetSQL(ObterConsultaPreencherValoresTotais(ObterColunaTotalizacaoMensal(i, False),
+                                                             PesquisaDataInicial,
+                                                             PesquisaDataFinal,
+                                                             True,
+                                                             True));
+            AuxDS.Execute(FDB.GetDataConnection);
+            ProximoPassoNoProgresso();
+          end
+          else
+          begin
+            AuxDS.SetSQL(ObterConsultaPreencherValoresTotais(ObterColunaTotalizacaoMensal(i, False),
+                                                             PesquisaDataInicial,
+                                                             PesquisaDataFinal,
+                                                             True,
+                                                             False));
+            AuxDS.Execute(FDB.GetDataConnection);
+            ProximoPassoNoProgresso();
+
+            if FInterromperExecucao then
+              Break;
+
+            AuxDS.SetSQL(ObterConsultaPreencherValoresTotais(ObterColunaTotalizacaoMensal(i, False),
+                                                             PesquisaDataInicial,
+                                                             PesquisaDataFinal,
+                                                             False,
+                                                             True));
+            AuxDS.Execute(FDB.GetDataConnection);
+            ProximoPassoNoProgresso();
+          end;
+          AuxDS.SetNoParsing(False);
+        finally
+          if Assigned(AuxDS) then
+            FreeAndNil(AuxDS);
+        end;
+      end;
+  end;
+  {$endregion}
+  {$region 'Totalizadores Graus não analiticos'}
+  CamposValor := EmptyStr;
+  for Campo in Campos do
+    if Assigned(Campo.NodeTreeView) then
+      if ((Campo.NodeTreeView.StateIndex = IndiceImagemSelecionado) and (not ProcuraListaString(Campo.ColunaBanco, CAMPOS_SEM_UPDATE))) then
+        CamposValor := CamposValor + ', SUM(' + TabelaBalancetes + '.' + Campo.ColunaBanco + ') ' + Campo.ColunaBanco;
+
+  if (ApuracaoAnual) then
+    for i := 1 to 13 do
+      CamposValor := CamposValor + ', SUM(' + TabelaBalancetes + '.' + ObterColunaTotalizacaoMensal(i, False) + ') ' + ObterColunaTotalizacaoMensal(i, False);
+
+  for i := 1 to iTotalNiveisPlanoConta - 1 do
+  begin
+    if FInterromperExecucao then
+      Break;
+    Script := 'SELECT Plano.enterprise_id, ' +
+                     IfThen(ConsolidaEstabelecimento, TabelaBalancetes + '.cd_empresa, ') +
+                     'Plano.classificacao, ' +
+                     'Plano.cd_conta, ' +
+                     'Plano.descricao, ' +
+                     'Plano.nr_grau, ' +
+                     TabelaBalancetes + '.natureza ' +
+                     CamposValor +
+             ' FROM ' + TabelaBalancetes +
+             ' INNER JOIN Plano ON (' + TabelaBalancetes + '.enterprise_id = Plano.enterprise_id ' +
+                              ' AND Plano.nr_grau = ' + TabelaBalancetes + '.nr_grau - ' + IntToStr(i) +
+                              ' AND Plano.classificacao = left(' + TabelaBalancetes + '.classificacao, ' + sFuncaoLength + '(Plano.classificacao))) ' +
+              'GROUP BY Plano.enterprise_id, ' +
+                        IfThen(ConsolidaEstabelecimento, TabelaBalancetes + '.cd_empresa, ') +
+                       'Plano.classificacao, ' +
+                       'Plano.cd_conta, ' +
+                       'Plano.descricao, ' +
+                       'Plano.nr_grau, ' +
+                        TabelaBalancetes + '.natureza ';
+
+
+    TabelaTemporaria.CriarTabelaPelaConsultaComNome(Script, TABELA_BALANCETE_GRAUS_MENOS + IntToStr(i), TabelaBalancetesTotais);
+    TabelasDRE.Add(TabelaBalancetesTotais);
+    ProximoPassoNoProgresso();
+  end;
+  {$endregion}
+
+  if PrecisaConsultarValoresLancamento then
+  begin
+    TabelaTemporaria.ExcluirTabelaComNomeSeExistir(TabelaLancamento);
+    ProximoPassoNoProgresso();
+  end;
+end;
